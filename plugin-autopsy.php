@@ -21,6 +21,39 @@ define('PLUGIN_AUTOPSY_VERSION', '1.0.0');
 define('PLUGIN_AUTOPSY_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('PLUGIN_AUTOPSY_PLUGIN_URL', plugin_dir_url(__FILE__));
 
+// Privacy and security configuration options
+// Set these in wp-config.php to control what data is logged
+
+// Control query logging (default: true)
+if (!defined('PLUGIN_AUTOPSY_LOG_QUERIES')) {
+    define('PLUGIN_AUTOPSY_LOG_QUERIES', true);
+}
+
+// Control file path logging (default: true)
+if (!defined('PLUGIN_AUTOPSY_LOG_PATHS')) {
+    define('PLUGIN_AUTOPSY_LOG_PATHS', true);
+}
+
+// Control memory tracking (default: true)
+if (!defined('PLUGIN_AUTOPSY_LOG_MEMORY')) {
+    define('PLUGIN_AUTOPSY_LOG_MEMORY', true);
+}
+
+// Control asset tracking (default: true)
+if (!defined('PLUGIN_AUTOPSY_LOG_ASSETS')) {
+    define('PLUGIN_AUTOPSY_LOG_ASSETS', true);
+}
+
+// Maximum query length to store (default: 1000 characters)
+if (!defined('PLUGIN_AUTOPSY_MAX_QUERY_LENGTH')) {
+    define('PLUGIN_AUTOPSY_MAX_QUERY_LENGTH', 1000);
+}
+
+// Data retention period in days (default: 30 days)
+if (!defined('PLUGIN_AUTOPSY_DATA_RETENTION_DAYS')) {
+    define('PLUGIN_AUTOPSY_DATA_RETENTION_DAYS', 30);
+}
+
 class PluginAutopsy {
     
     private static $instance = null;
@@ -45,6 +78,11 @@ class PluginAutopsy {
         add_action('init', [$this, 'init_trackers']);
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_scripts']);
+        
+        // AJAX handlers
+        add_action('wp_ajax_plugin_autopsy_refresh_data', [$this, 'ajax_refresh_data']);
+        add_action('wp_ajax_plugin_autopsy_clear_data', [$this, 'ajax_clear_data']);
+        add_action('wp_ajax_plugin_autopsy_get_slow_queries', [$this, 'ajax_get_slow_queries']);
         
         register_activation_hook(__FILE__, [$this, 'activate']);
         register_deactivation_hook(__FILE__, [$this, 'deactivate']);
@@ -564,6 +602,212 @@ class PluginAutopsy {
         }
         
         return '';
+    }
+    
+    /**
+     * AJAX handler for refreshing performance data
+     */
+    public function ajax_refresh_data() {
+        // Verify nonce
+        if (!check_ajax_referer('plugin_autopsy_nonce', 'nonce', false)) {
+            wp_send_json_error(['message' => __('Security check failed', 'plugin-autopsy')]);
+            return;
+        }
+        
+        // Check user capabilities
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Insufficient permissions', 'plugin-autopsy')]);
+            return;
+        }
+        
+        try {
+            // Clear any existing output buffers to force fresh data collection
+            if (ob_get_level()) {
+                ob_clean();
+            }
+            
+            // Trigger data collection by visiting current page
+            wp_send_json_success(['message' => __('Data refresh initiated. Please reload the page to see updated results.', 'plugin-autopsy')]);
+            
+        } catch (Exception $e) {
+            wp_send_json_error(['message' => __('Error refreshing data: ', 'plugin-autopsy') . $e->getMessage()]);
+        }
+    }
+    
+    /**
+     * AJAX handler for clearing old performance data
+     */
+    public function ajax_clear_data() {
+        // Verify nonce
+        if (!check_ajax_referer('plugin_autopsy_nonce', 'nonce', false)) {
+            wp_send_json_error(['message' => __('Security check failed', 'plugin-autopsy')]);
+            return;
+        }
+        
+        // Check user capabilities
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Insufficient permissions', 'plugin-autopsy')]);
+            return;
+        }
+        
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'plugin_autopsy_data';
+        
+        try {
+            // Delete data older than configured retention period
+            $retention_days = PLUGIN_AUTOPSY_DATA_RETENTION_DAYS;
+            $deleted = $wpdb->query($wpdb->prepare("
+                DELETE FROM {$table_name} 
+                WHERE timestamp < DATE_SUB(NOW(), INTERVAL %d DAY)
+            ", $retention_days));
+            
+            if ($deleted === false) {
+                wp_send_json_error(['message' => __('Database error occurred while clearing data', 'plugin-autopsy')]);
+                return;
+            }
+            
+            wp_send_json_success([
+                'message' => sprintf(__('Successfully cleared %d old records', 'plugin-autopsy'), $deleted),
+                'deleted_count' => $deleted
+            ]);
+            
+        } catch (Exception $e) {
+            wp_send_json_error(['message' => __('Error clearing data: ', 'plugin-autopsy') . $e->getMessage()]);
+        }
+    }
+    
+    /**
+     * AJAX handler for getting slow queries for a specific plugin
+     */
+    public function ajax_get_slow_queries() {
+        // Verify nonce
+        if (!check_ajax_referer('plugin_autopsy_nonce', 'nonce', false)) {
+            wp_send_json_error(['message' => __('Security check failed', 'plugin-autopsy')]);
+            return;
+        }
+        
+        // Check user capabilities
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => __('Insufficient permissions', 'plugin-autopsy')]);
+            return;
+        }
+        
+        // Sanitize plugin parameter
+        $plugin_slug = isset($_POST['plugin']) ? sanitize_text_field($_POST['plugin']) : '';
+        
+        if (empty($plugin_slug)) {
+            wp_send_json_error(['message' => __('Plugin parameter is required', 'plugin-autopsy')]);
+            return;
+        }
+        
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'plugin_autopsy_data';
+        
+        try {
+            $slow_queries_data = $wpdb->get_results($wpdb->prepare("
+                SELECT metric_value, timestamp 
+                FROM {$table_name} 
+                WHERE plugin_name = %s 
+                AND metric_type = 'database_queries'
+                AND timestamp >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                ORDER BY timestamp DESC 
+                LIMIT 10
+            ", $plugin_slug));
+            
+            $slow_queries_html = '<h3>' . sprintf(__('Slow Queries for %s', 'plugin-autopsy'), esc_html($this->get_plugin_name_from_slug($plugin_slug))) . '</h3>';
+            
+            if (empty($slow_queries_data)) {
+                $slow_queries_html .= '<p>' . __('No slow queries found in the last 24 hours.', 'plugin-autopsy') . '</p>';
+            } else {
+                $slow_queries_html .= '<div class="slow-queries-list">';
+                
+                foreach ($slow_queries_data as $data) {
+                    $metric_value = json_decode($data->metric_value, true);
+                    $slow_queries = $metric_value['slow_queries'] ?? [];
+                    
+                    if (!empty($slow_queries)) {
+                        foreach ($slow_queries as $query) {
+                            $sanitized_query = $this->sanitize_query_for_display($query['query'] ?? '');
+                            $query_time = number_format(($query['time'] ?? 0) * 1000, 2);
+                            
+                            $slow_queries_html .= '<div class="slow-query-item">';
+                            $slow_queries_html .= '<div class="query-time"><strong>' . $query_time . 'ms</strong></div>';
+                            $slow_queries_html .= '<div class="query-text"><code>' . esc_html($sanitized_query) . '</code></div>';
+                            if (!empty($query['file'])) {
+                                $relative_file = $this->get_relative_file_path($query['file']);
+                                $slow_queries_html .= '<div class="query-file">File: ' . esc_html($relative_file) . ':' . intval($query['line'] ?? 0) . '</div>';
+                            }
+                            $slow_queries_html .= '</div>';
+                        }
+                    }
+                }
+                
+                $slow_queries_html .= '</div>';
+            }
+            
+            wp_send_json_success($slow_queries_html);
+            
+        } catch (Exception $e) {
+            wp_send_json_error(['message' => __('Error retrieving slow queries: ', 'plugin-autopsy') . $e->getMessage()]);
+        }
+    }
+    
+    /**
+     * Sanitize SQL queries for safe display by removing sensitive data
+     */
+    private function sanitize_query_for_display($query) {
+        if (empty($query)) {
+            return '';
+        }
+        
+        // Patterns to remove sensitive data
+        $sensitive_patterns = [
+            '/password\s*=\s*[\'"][^\'"]*[\'"]/i' => 'password = [REDACTED]',
+            '/pwd\s*=\s*[\'"][^\'"]*[\'"]/i' => 'pwd = [REDACTED]',
+            '/token\s*=\s*[\'"][^\'"]*[\'"]/i' => 'token = [REDACTED]',
+            '/api_key\s*=\s*[\'"][^\'"]*[\'"]/i' => 'api_key = [REDACTED]',
+            '/secret\s*=\s*[\'"][^\'"]*[\'"]/i' => 'secret = [REDACTED]',
+            '/auth\s*=\s*[\'"][^\'"]*[\'"]/i' => 'auth = [REDACTED]',
+            '/session\s*=\s*[\'"][^\'"]*[\'"]/i' => 'session = [REDACTED]',
+        ];
+        
+        foreach ($sensitive_patterns as $pattern => $replacement) {
+            $query = preg_replace($pattern, $replacement, $query);
+        }
+        
+        // Limit query length for display
+        if (strlen($query) > 500) {
+            $query = substr($query, 0, 500) . '... [TRUNCATED]';
+        }
+        
+        return $query;
+    }
+    
+    /**
+     * Convert absolute file paths to relative paths for security
+     */
+    private function get_relative_file_path($file_path) {
+        if (empty($file_path)) {
+            return '';
+        }
+        
+        // Remove sensitive server paths
+        $replacements = [
+            wp_normalize_path(ABSPATH) => '',
+            wp_normalize_path(WP_CONTENT_DIR) => '/wp-content',
+            wp_normalize_path(WP_PLUGIN_DIR) => '/wp-content/plugins',
+            wp_normalize_path(get_theme_root()) => '/wp-content/themes',
+        ];
+        
+        $relative_path = $file_path;
+        foreach ($replacements as $absolute => $relative) {
+            if (strpos($file_path, $absolute) === 0) {
+                $relative_path = $relative . str_replace($absolute, '', $file_path);
+                break;
+            }
+        }
+        
+        return $relative_path;
     }
 }
 

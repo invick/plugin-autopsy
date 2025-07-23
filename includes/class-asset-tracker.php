@@ -10,10 +10,20 @@ class Plugin_Autopsy_Asset_Tracker {
     private $plugin_assets = [];
     
     public function __construct() {
+        // Only initialize if asset logging is enabled
+        if (!PLUGIN_AUTOPSY_LOG_ASSETS) {
+            return;
+        }
+        
         $this->init();
     }
     
     private function init() {
+        // Double-check asset logging is enabled
+        if (!PLUGIN_AUTOPSY_LOG_ASSETS) {
+            return;
+        }
+        
         add_action('wp_enqueue_scripts', [$this, 'track_frontend_assets'], 9999);
         add_action('admin_enqueue_scripts', [$this, 'track_admin_assets'], 9999);
         add_action('wp_head', [$this, 'capture_head_assets'], 9999);

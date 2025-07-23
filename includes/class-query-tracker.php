@@ -161,13 +161,17 @@ class Plugin_Autopsy_Query_Tracker {
         $current_url = $this->get_current_url();
         
         foreach ($this->plugin_queries as $plugin_slug => $data) {
+            // Sanitize queries before storage
+            $sanitized_queries = $this->sanitize_queries_for_storage(array_slice($data['queries'], 0, 10));
+            $sanitized_slow_queries = $this->sanitize_queries_for_storage($data['slow_queries']);
+            
             $metric_value = json_encode([
                 'query_count' => $data['query_count'],
                 'total_time' => $data['total_time'],
                 'average_time' => $data['query_count'] > 0 ? $data['total_time'] / $data['query_count'] : 0,
                 'slow_query_count' => count($data['slow_queries']),
-                'queries' => array_slice($data['queries'], 0, 10),
-                'slow_queries' => $data['slow_queries']
+                'queries' => $sanitized_queries,
+                'slow_queries' => $sanitized_slow_queries
             ]);
             
             $wpdb->insert(
@@ -214,5 +218,111 @@ class Plugin_Autopsy_Query_Tracker {
         });
         
         return $summary;
+    }
+    
+    /**
+     * Sanitize queries array for safe storage
+     */
+    private function sanitize_queries_for_storage($queries) {
+        if (empty($queries) || !is_array($queries)) {
+            return [];
+        }
+        
+        $sanitized = [];
+        foreach ($queries as $query_data) {
+            if (!is_array($query_data)) {
+                continue;
+            }
+            
+            $sanitized_query = $query_data;
+            
+            // Sanitize the query text if present
+            if (isset($query_data['query'])) {
+                $sanitized_query['query'] = $this->sanitize_query_text($query_data['query']);
+            }
+            
+            // Convert absolute file paths to relative paths
+            if (isset($query_data['file'])) {
+                $sanitized_query['file'] = $this->get_relative_file_path($query_data['file']);
+            }
+            
+            $sanitized[] = $sanitized_query;
+        }
+        
+        return $sanitized;
+    }
+    
+    /**
+     * Sanitize SQL query text by removing sensitive data
+     */
+    private function sanitize_query_text($query) {
+        if (empty($query)) {
+            return '';
+        }
+        
+        // Check if query logging is disabled
+        if (defined('PLUGIN_AUTOPSY_LOG_QUERIES') && !PLUGIN_AUTOPSY_LOG_QUERIES) {
+            return '[Query logging disabled]';
+        }
+        
+        // Patterns to remove sensitive data
+        $sensitive_patterns = [
+            '/password\s*=\s*[\'"][^\'"]*[\'"]/i' => 'password = [REDACTED]',
+            '/pwd\s*=\s*[\'"][^\'"]*[\'"]/i' => 'pwd = [REDACTED]',
+            '/token\s*=\s*[\'"][^\'"]*[\'"]/i' => 'token = [REDACTED]',
+            '/api_key\s*=\s*[\'"][^\'"]*[\'"]/i' => 'api_key = [REDACTED]',
+            '/secret\s*=\s*[\'"][^\'"]*[\'"]/i' => 'secret = [REDACTED]',
+            '/auth\s*=\s*[\'"][^\'"]*[\'"]/i' => 'auth = [REDACTED]',
+            '/session\s*=\s*[\'"][^\'"]*[\'"]/i' => 'session = [REDACTED]',
+            '/nonce\s*=\s*[\'"][^\'"]*[\'"]/i' => 'nonce = [REDACTED]',
+            // Remove email addresses from queries
+            '/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/' => '[EMAIL]',
+            // Remove potential IP addresses
+            '/\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b/' => '[IP]',
+        ];
+        
+        foreach ($sensitive_patterns as $pattern => $replacement) {
+            $query = preg_replace($pattern, $replacement, $query);
+        }
+        
+        // Limit query length for storage efficiency
+        $max_length = PLUGIN_AUTOPSY_MAX_QUERY_LENGTH;
+        if (strlen($query) > $max_length) {
+            $query = substr($query, 0, $max_length) . '... [TRUNCATED]';
+        }
+        
+        return $query;
+    }
+    
+    /**
+     * Convert absolute file paths to relative paths for security
+     */
+    private function get_relative_file_path($file_path) {
+        if (empty($file_path)) {
+            return '';
+        }
+        
+        // Check if file path logging is disabled
+        if (defined('PLUGIN_AUTOPSY_LOG_PATHS') && !PLUGIN_AUTOPSY_LOG_PATHS) {
+            return '[Path logging disabled]';
+        }
+        
+        // Remove sensitive server paths
+        $replacements = [
+            wp_normalize_path(ABSPATH) => '',
+            wp_normalize_path(WP_CONTENT_DIR) => '/wp-content',
+            wp_normalize_path(WP_PLUGIN_DIR) => '/wp-content/plugins',
+            wp_normalize_path(get_theme_root()) => '/wp-content/themes',
+        ];
+        
+        $relative_path = $file_path;
+        foreach ($replacements as $absolute => $relative) {
+            if (strpos(wp_normalize_path($file_path), $absolute) === 0) {
+                $relative_path = $relative . str_replace($absolute, '', wp_normalize_path($file_path));
+                break;
+            }
+        }
+        
+        return $relative_path;
     }
 }

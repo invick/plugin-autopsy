@@ -12,11 +12,21 @@ class Plugin_Autopsy_Memory_Tracker {
     private $hook_memory = [];
     
     public function __construct() {
+        // Only initialize if memory logging is enabled
+        if (!PLUGIN_AUTOPSY_LOG_MEMORY) {
+            return;
+        }
+        
         $this->initial_memory = memory_get_usage(true);
         $this->init();
     }
     
     private function init() {
+        // Double-check memory logging is enabled
+        if (!PLUGIN_AUTOPSY_LOG_MEMORY) {
+            return;
+        }
+        
         add_action('plugins_loaded', [$this, 'take_snapshot'], 1);
         add_action('init', [$this, 'take_snapshot']);
         add_action('wp_loaded', [$this, 'take_snapshot']);
@@ -102,32 +112,49 @@ class Plugin_Autopsy_Memory_Tracker {
     }
     
     private function identify_plugin_from_callback($callback) {
-        if (is_string($callback)) {
-            $function_info = new ReflectionFunction($callback);
-            $filename = $function_info->getFileName();
-        } elseif (is_array($callback) && count($callback) === 2) {
-            if (is_object($callback[0])) {
-                $reflection = new ReflectionClass($callback[0]);
-                $filename = $reflection->getFileName();
-            } elseif (is_string($callback[0])) {
-                try {
+        try {
+            $filename = false;
+            
+            if (is_string($callback)) {
+                // Check if function exists before reflection
+                if (!function_exists($callback)) {
+                    return false;
+                }
+                $function_info = new ReflectionFunction($callback);
+                $filename = $function_info->getFileName();
+            } elseif (is_array($callback) && count($callback) === 2) {
+                if (is_object($callback[0])) {
                     $reflection = new ReflectionClass($callback[0]);
                     $filename = $reflection->getFileName();
-                } catch (ReflectionException $e) {
+                } elseif (is_string($callback[0])) {
+                    // Check if class exists before reflection
+                    if (!class_exists($callback[0])) {
+                        return false;
+                    }
+                    $reflection = new ReflectionClass($callback[0]);
+                    $filename = $reflection->getFileName();
+                } else {
                     return false;
                 }
             } else {
                 return false;
             }
-        } else {
+            
+            if (!$filename || $filename === false) {
+                return false;
+            }
+            
+            return $this->identify_plugin_from_file($filename);
+            
+        } catch (ReflectionException $e) {
+            // Log error if needed but don't expose details
+            error_log('Plugin Autopsy: Reflection error in callback identification');
+            return false;
+        } catch (Exception $e) {
+            // Catch any other exceptions
+            error_log('Plugin Autopsy: Error in callback identification');
             return false;
         }
-        
-        if (!$filename) {
-            return false;
-        }
-        
-        return $this->identify_plugin_from_file($filename);
     }
     
     private function identify_plugin_from_file($filename) {
@@ -141,12 +168,44 @@ class Plugin_Autopsy_Memory_Tracker {
             if (!empty($plugin_parts[0])) {
                 return [
                     'slug' => $plugin_parts[0],
-                    'file' => $filename
+                    'file' => $this->get_relative_file_path($filename)
                 ];
             }
         }
         
         return false;
+    }
+    
+    /**
+     * Convert absolute file paths to relative paths for security
+     */
+    private function get_relative_file_path($file_path) {
+        if (empty($file_path)) {
+            return '';
+        }
+        
+        // Check if file path logging is disabled
+        if (defined('PLUGIN_AUTOPSY_LOG_PATHS') && !PLUGIN_AUTOPSY_LOG_PATHS) {
+            return '[Path logging disabled]';
+        }
+        
+        // Remove sensitive server paths
+        $replacements = [
+            wp_normalize_path(ABSPATH) => '',
+            wp_normalize_path(WP_CONTENT_DIR) => '/wp-content',
+            wp_normalize_path(WP_PLUGIN_DIR) => '/wp-content/plugins',
+            wp_normalize_path(get_theme_root()) => '/wp-content/themes',
+        ];
+        
+        $relative_path = $file_path;
+        foreach ($replacements as $absolute => $relative) {
+            if (strpos(wp_normalize_path($file_path), $absolute) === 0) {
+                $relative_path = $relative . str_replace($absolute, '', wp_normalize_path($file_path));
+                break;
+            }
+        }
+        
+        return $relative_path;
     }
     
     private function attribute_memory_to_plugins($hook, $memory_increase) {
